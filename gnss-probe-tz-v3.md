@@ -77,7 +77,7 @@ Nomad periodic scheduler
 Проба определяет тип старта следующими методами (в порядке приоритета):
 
 1. **GNTXT / GPTXT предложения:** u-blox и ряд других чипов явно пишут `COLD START` / `WARM START` / `HOT START` в первые 2 секунды
-2. **VID/PID + флаг has_vbat из whitelist:** если VBAT есть и последний фикс был < 4 часов назад — hot/warm
+2. **VID/PID + флаг has_vbat из whitelist:** если VBAT есть и последний фикс был < 4 часов назад (по кэшу `GPS_CACHE_PATH`) — hot start; если VBAT отсутствует — cold start
 3. **Прогрессия числа спутников:** быстрый рост до > 4 спутников за < 10 секунд = hot start
 4. **Fallback:** если `GPS_ASSUME_COLD_START=true` или тип не определён — всегда cold
 
@@ -224,14 +224,6 @@ GPS_FIX_TIMEOUT_HOT=8s
 | `provider = "mixed"` | Есть `$GLGSV`, `$GAGSV` или `$PQGSV` | Независимо от талкера GGA |
 | Число спутников всего | Сумма полей 3 из всех GSV | `$GPGSV` + `$GLGSV` + `$GAGSV` + `$PQGSV` |
 | `start_type` | `$GPTXT` содержит текст старта | EC25 пишет в GPTXT, не в GNTXT |
-| Число спутников в фиксе | `$GPGGA` поле 7 | Только GPS спутники в фиксе |
-| GLONASS активен | Наличие `$GLGSV` в потоке | Если `$GLGSV` есть → GLONASS виден |
-| Galileo активен | Наличие `$GAGSV` в потоке | Если `$GAGSV` есть → Galileo виден |
-| BeiDou активен | Наличие `$PQGSV` в потоке | EC25 использует PQ prefix для BeiDou |
-| `provider = "gps"` | Только `$GPGSV`, нет `$GLGSV`/`$GAGSV`/`$PQGSV` | — |
-| `provider = "mixed"` | Есть хотя бы один `$GLGSV`, `$GAGSV` или `$PQGSV` | Независимо от талкера GGA |
-| Число спутников всего | `$GPGSV` поле 3 + `$GLGSV` поле 3 + … | Суммировать total из каждого GSV типа |
-| `start_type` (hot/warm/cold) | `$GPTXT` содержит "HOT START" / "WARM START" / "COLD START" | EC25 пишет в GPTXT, не в GNTXT |
 
 ### 5.4. Универсальная логика определения provider
 
@@ -294,6 +286,7 @@ switch {
 | `GPS_ASSUME_COLD_START` | `false` | Принудительный cold-таймаут для приёмников без VBAT |
 | `GPS_AUTO_SCAN` | `false` | Включить auto-scan поверх GPS_DEVICE |
 | `GPS_SCAN_TIMEOUT` | `3s` | Таймаут NMEA-пробы одного кандидата |
+| `GPS_CACHE_PATH` | `/var/lib/gnss-probe/last_fix.json` | Путь к файлу кэша позиции |
 | `GPS_MODE` | `auto` | `serial` / `modem` / `auto` — выбор режима работы |
 | `GPS_MODEM_AT_PORT` | — | Явный путь к AT-порту модема |
 | `GPS_MODEM_NMEA_PORT` | — | Явный путь к NMEA-порту модема |
@@ -1017,12 +1010,40 @@ groups:
 - Reconnect: до 3 попыток с задержкой 1s при открытии serial порта
 - Partial result: всегда эмитируется JSON, даже при exit 1
 - VID/PID: читается из Linux sysfs — не требует lsusb/udevadm
-- Кэш позиции: `/var/lib/gnss-probe/last_fix.json` — монтируется как volume
+- Кэш позиции: `GPS_CACHE_PATH` (default `/var/lib/gnss-probe/last_fix.json`) — монтируется как volume
 - ARM совместимость: `GOARCH=arm64` для Raspberry Pi / edge устройств
 - Modem mode: два параллельных порта (AT + NMEA), определение через `bInterfaceNumber` из sysfs
 - XTRA: загрузка файла эфемерид через LTE для Quectel, сокращение cold start до 2–8 секунд
 - Максимальное время работы: `kill_timeout` в Nomad должен быть > max(GPS_FIX_TIMEOUT_*) + 10s
 - Concurrency: один экземпляр на устройство, `prohibit_overlap = true` в Nomad periodic job
+
+---
+
+## 18. Структура проекта
+
+```
+gnss-probe/
+├── main.go                      — точка входа, exit codes
+├── go.mod / go.sum
+├── Dockerfile                   — multi-stage build, scratch image
+├── nomad/
+│   ├── gnss-probe.hcl             — serial mode, явное устройство
+│   ├── gnss-probe-autoscan.hcl    — serial mode, auto-scan
+│   └── gnss-probe-quectel.hcl     — modem mode, Quectel + XTRA
+└── internal/
+    ├── config/config.go           — ENV переменные, валидация, TimeoutFor()
+    ├── device/detect.go           — whitelist VID/PID, sysfs scan, NMEA probe
+    ├── nmea/parser.go             — парсинг NMEA, provider через GSV, start_type
+    ├── cache/cache.go             — чтение/запись last_fix.json (атомарно)
+    ├── assist/assist.go           — assisted start: $PUBX,04 / $PMTK740 / $PSRF104
+    ├── probe/
+    │   ├── probe.go                 — диспетчер serial vs modem
+    │   └── serial.go                — serial mode: open → assist → read NMEA → cache
+    ├── modem/
+    │   ├── modem.go                 — FindPorts (sysfs + fallback), AT()
+    │   └── run.go                   — modem mode: AT init → XTRA → read NMEA → cache
+    └── result/result.go           — JSON структуры, Emit(), константы exit codes
+```
 
 ---
 
@@ -1043,6 +1064,11 @@ groups:
 - Добавлена сравнительная таблица талкеров u-blox vs EC25 для всех типов предложений
 - Добавлены правила парсинга для EC25: `provider` определяется через GSV талкеры (`$GLGSV`/`$GAGSV`/`$PQGSV`), а не через талкер GGA/RMC
 - Исправлена логика определения provider: убрана ошибочная проверка `talker(GGA)==GN`
+- Добавлена ENV `GPS_CACHE_PATH` для переопределения пути к файлу кэша позиции
+- Уточнена логика раздела 3.2 п.2: VBAT + кэш < 4ч → hot start; нет VBAT → cold start
+- Добавлены разделы 11–18: обработка ошибок modem mode, troubleshooting, security, совместимость, метрики, Vector, структура проекта
+- Исправлено: дублирующиеся строки в таблице 5.3 удалены
+- Исправлено: порог priority в разделе 4.1 уточнён (> 80 вместо ≥ 90)
 
 ### v2.0 — Таймауты и USB Auto-Detection
 
